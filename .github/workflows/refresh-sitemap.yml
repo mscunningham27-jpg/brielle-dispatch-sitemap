@@ -1,0 +1,64 @@
+name: Refresh dispatch sitemap
+
+# Rebuilds sitemap-dispatches.xml from the verified dispatch list stored in
+# https://brielleyork.com/dispatches (written by the Dispatch Bridge sync).
+# Commits only when the file's bytes change. On any doubt it changes nothing.
+
+on:
+  schedule:
+    - cron: "50 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  actions: write
+
+concurrency:
+  group: sitemap
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build sitemap from the verified dispatch list
+        id: build
+        run: python3 .github/build_sitemap.py
+
+      - name: Commit only if the file changed
+        id: commit
+        if: steps.build.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add sitemap-dispatches.xml
+          git commit -m "Update dispatch sitemap (${{ steps.build.outputs.count }} URLs)"
+          git push
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish and confirm the public URL serves the new file
+        if: steps.build.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X POST "repos/${{ github.repository }}/pages/builds" >/dev/null || echo "Pages build request not accepted; waiting for the automatic build"
+          want=$(sha256sum sitemap-dispatches.xml | cut -d' ' -f1)
+          url="https://mscunningham27-jpg.github.io/brielle-dispatch-sitemap/sitemap-dispatches.xml"
+          for i in $(seq 1 40); do
+            sleep 15
+            got=$(curl -fsSL "$url?check=${{ github.run_id }}-$i" | sha256sum | cut -d' ' -f1) || true
+            if [ "$got" = "$want" ]; then echo "Live at $url (commit ${{ steps.commit.outputs.sha }})"; exit 0; fi
+          done
+          echo "::error::Committed but the public URL did not show the new sitemap within 10 minutes"
+          exit 1
+
+      - name: Keep this schedule from being paused after 60 quiet days
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/refresh-sitemap.yml/enable"
